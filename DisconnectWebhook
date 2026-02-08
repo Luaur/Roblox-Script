@@ -1,0 +1,388 @@
+local Spectre = {}
+
+-- DEFAULT CONFIG (Kosong karena akan diisi via GUI)
+Spectre.Config = {
+    Webhook = "",
+    DiscordID = "",
+    PingUser = true,
+    CrashRAM = 2800,
+    PingFreezeLimit = 5,
+    Enabled = true -- Status Toggle Awal
+}
+
+Spectre.Services = {
+    Players = game:GetService("Players"),
+    CoreGui = game:GetService("CoreGui"),
+    Http = game:GetService("HttpService"),
+    Gui = game:GetService("GuiService"),
+    Stats = game:GetService("Stats"),
+    Input = game:GetService("UserInputService"),
+    Teleport = game:GetService("TeleportService")
+}
+
+Spectre.State = {
+    Disconnected = false,
+    Teleporting = false,
+    Background = false,
+    PingHistory = {},
+    LastPing = 0,
+    FreezeCount = 0,
+    SettingsOpen = false
+}
+
+-- FILE SYSTEM (AUTO-SAVE/LOAD)
+local FileName = "Spectre_Config_v2.json"
+function Spectre:LoadConfig()
+    if isfile and isfile(FileName) then
+        local success, decoded = pcall(function() return Spectre.Services.Http:JSONDecode(readfile(FileName)) end)
+        if success and decoded then
+            self.Config.Webhook = decoded.Webhook or ""
+            self.Config.DiscordID = decoded.DiscordID or ""
+            self.Config.Enabled = decoded.Enabled
+            if self.Config.Enabled == nil then self.Config.Enabled = true end
+        end
+    end
+end
+
+function Spectre:SaveConfig()
+    if writefile then
+        local data = {
+            Webhook = self.Config.Webhook,
+            DiscordID = self.Config.DiscordID,
+            Enabled = self.Config.Enabled
+        }
+        writefile(FileName, self.Services.Http:JSONEncode(data))
+    end
+end
+
+-- HELPER FUNCTIONS
+local floor = math.floor
+local format = string.format
+local insert = table.insert
+local remove = table.remove
+
+local function GetDevice()
+    return Spectre.Services.Input.TouchEnabled and "Mobile" or "PC"
+end
+
+local function FormatTime(s)
+    return format("%02d:%02d:%02d", floor(s/3600), floor((s%3600)/60), s%60)
+end
+
+local function HttpRequest(url, body)
+    if url == "" or not url:find("http") then return end -- Jangan kirim jika webhook kosong
+    local req = (syn and syn.request) or (http and http.request) or http_request or (fluxus and fluxus.request) or request
+    if req then
+        req({
+            Url = url,
+            Method = "POST",
+            Headers = {["Content-Type"] = "application/json"},
+            Body = Spectre.Services.Http:JSONEncode(body)
+        })
+    end
+end
+
+function Spectre:CaptureBlackbox()
+    local ping = floor(self.Services.Stats.Network.ServerStatsItem["Data Ping"]:GetValue())
+    local fps = floor(workspace:GetRealPhysicsFPS())
+    local ram = floor(self.Services.Stats:GetTotalMemoryUsageMb())
+    local timeStr = os.date("%X")
+    
+    insert(self.State.PingHistory, {p=ping, f=fps, r=ram, t=timeStr})
+    if #self.State.PingHistory > 10 then remove(self.State.PingHistory, 1) end
+    return ping, ram, fps
+end
+
+function Spectre:FormatBlackboxLog()
+    local log = "```ini\n[TIME]    [PING]  [FPS]  [RAM]\n"
+    for _, data in ipairs(self.State.PingHistory) do
+        log = log .. format("%s  %3dms   %2d    %4dMB\n", data.t, data.p, data.f, data.r)
+    end
+    return log .. "```"
+end
+
+function Spectre:Dispatch(category, reason, color, priority)
+    -- Cek Toggle
+    if not self.Config.Enabled and not priority then return end 
+    if self.State.Disconnected and not priority then return end
+    if not priority then self.State.Disconnected = true end
+
+    if self.UI and not priority then 
+        self.UI.Main.Status.BackgroundColor3 = Color3.fromRGB(255, 50, 50)
+        self.UI.Main.Title.Text = "DISCONNECTED" 
+    end
+
+    local pingContent = (self.Config.PingUser and not priority and self.Config.DiscordID ~= "") and ("<@"..self.Config.DiscordID..">") or ""
+    local blackbox = self:FormatBlackboxLog()
+    
+    local fields = {
+        {["name"] = "Device", ["value"] = GetDevice(), ["inline"] = true},
+        {["name"] = "Uptime", ["value"] = FormatTime(os.time() - self.StartTime), ["inline"] = true},
+        {["name"] = "Reason", ["value"] = reason, ["inline"] = false}
+    }
+
+    if not priority then
+        insert(fields, {["name"] = "Spectre Blackbox", ["value"] = blackbox, ["inline"] = false})
+    end
+
+    local payload = {
+        ["content"] = pingContent,
+        ["embeds"] = {{
+            ["title"] = category,
+            ["color"] = color,
+            ["fields"] = fields,
+            ["footer"] = {["text"] = "Spectre: Zero Point"},
+            ["timestamp"] = os.date("!%Y-%m-%dT%H:%M:%SZ")
+        }}
+    }
+
+    task.spawn(function() pcall(function() HttpRequest(self.Config.Webhook, payload) end) end)
+    
+    if not priority then
+        local t = os.clock()
+        while os.clock() - t < 1.5 do end
+    end
+end
+
+function Spectre:InitUI()
+    if getgenv().SpectreUI then getgenv().SpectreUI:Destroy() end
+    
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "SpectreInterface"
+    gui.ResetOnSpawn = false
+    gui.Parent = (gethui and gethui()) or self.Services.CoreGui
+    getgenv().SpectreUI = gui
+    
+    -- MAIN FRAME
+    local frame = Instance.new("Frame")
+    frame.Name = "Main"
+    frame.Size = UDim2.new(0, 260, 0, 36)
+    frame.Position = self.Services.Input.TouchEnabled and UDim2.new(0.5, -130, 0, 50) or UDim2.new(0.5, -130, 0, 20)
+    frame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+    frame.BackgroundTransparency = 0.1
+    frame.Parent = gui
+    
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+    local stroke = Instance.new("UIStroke", frame)
+    stroke.Color = Color3.fromRGB(60, 60, 80)
+    stroke.Thickness = 1
+    
+    -- STATUS DOT
+    local status = Instance.new("Frame")
+    status.Name = "Status"
+    status.Size = UDim2.new(0, 6, 0, 6)
+    status.Position = UDim2.new(0, 12, 0.5, -3)
+    status.BackgroundColor3 = Color3.fromRGB(0, 255, 200)
+    status.Parent = frame
+    Instance.new("UICorner", status).CornerRadius = UDim.new(1, 0)
+    
+    -- TITLE LABEL
+    local title = Instance.new("TextLabel")
+    title.Name = "Title"
+    title.Size = UDim2.new(0, 100, 1, 0)
+    title.Position = UDim2.new(0, 25, 0, 0)
+    title.BackgroundTransparency = 1
+    title.Text = "Spectre: Ready"
+    title.Font = Enum.Font.GothamBold
+    title.TextColor3 = Color3.fromRGB(230, 230, 230)
+    title.TextSize = 10
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = frame
+
+    -- SETTINGS BUTTON (GEAR)
+    local settingsBtn = Instance.new("TextButton")
+    settingsBtn.Size = UDim2.new(0, 24, 0, 24)
+    settingsBtn.Position = UDim2.new(1, -30, 0.5, -12)
+    settingsBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+    settingsBtn.Text = "⚙️"
+    settingsBtn.TextColor3 = Color3.fromRGB(200, 200, 200)
+    settingsBtn.TextSize = 14
+    settingsBtn.Parent = frame
+    Instance.new("UICorner", settingsBtn).CornerRadius = UDim.new(0, 4)
+
+    -- TOGGLE SWITCH
+    local toggleBtn = Instance.new("TextButton")
+    toggleBtn.Size = UDim2.new(0, 40, 0, 20)
+    toggleBtn.Position = UDim2.new(1, -75, 0.5, -10)
+    toggleBtn.BackgroundColor3 = self.Config.Enabled and Color3.fromRGB(0, 200, 100) or Color3.fromRGB(50, 50, 50)
+    toggleBtn.Text = self.Config.Enabled and "ON" or "OFF"
+    toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    toggleBtn.TextSize = 9
+    toggleBtn.Font = Enum.Font.GothamBold
+    toggleBtn.Parent = frame
+    Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 4)
+
+    -- SETTINGS PANEL
+    local configFrame = Instance.new("Frame")
+    configFrame.Name = "ConfigPanel"
+    configFrame.Size = UDim2.new(1, 0, 0, 110)
+    configFrame.Position = UDim2.new(0, 0, 1, 5)
+    configFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+    configFrame.Visible = false -- Hidden by default
+    configFrame.Parent = frame
+    Instance.new("UICorner", configFrame).CornerRadius = UDim.new(0, 8)
+    Instance.new("UIStroke", configFrame).Color = Color3.fromRGB(60, 60, 80)
+
+    -- Webhook Input
+    local wbInput = Instance.new("TextBox")
+    wbInput.Size = UDim2.new(1, -20, 0, 30)
+    wbInput.Position = UDim2.new(0, 10, 0, 10)
+    wbInput.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+    wbInput.Text = self.Config.Webhook
+    wbInput.PlaceholderText = "Paste Webhook URL Here..."
+    wbInput.TextColor3 = Color3.fromRGB(200, 200, 200)
+    wbInput.TextSize = 10
+    wbInput.Font = Enum.Font.Gotham
+    wbInput.Parent = configFrame
+    Instance.new("UICorner", wbInput).CornerRadius = UDim.new(0, 6)
+
+    -- ID Input
+    local idInput = Instance.new("TextBox")
+    idInput.Size = UDim2.new(1, -20, 0, 30)
+    idInput.Position = UDim2.new(0, 10, 0, 45)
+    idInput.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+    idInput.Text = self.Config.DiscordID
+    idInput.PlaceholderText = "Discord User ID (Optional)"
+    idInput.TextColor3 = Color3.fromRGB(200, 200, 200)
+    idInput.TextSize = 10
+    idInput.Font = Enum.Font.Gotham
+    idInput.Parent = configFrame
+    Instance.new("UICorner", idInput).CornerRadius = UDim.new(0, 6)
+
+    -- Save & Test Button
+    local saveBtn = Instance.new("TextButton")
+    saveBtn.Size = UDim2.new(1, -20, 0, 25)
+    saveBtn.Position = UDim2.new(0, 10, 0, 80)
+    saveBtn.BackgroundColor3 = Color3.fromRGB(0, 150, 255)
+    saveBtn.Text = "SAVE & TEST"
+    saveBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    saveBtn.Font = Enum.Font.GothamBold
+    saveBtn.TextSize = 10
+    saveBtn.Parent = configFrame
+    Instance.new("UICorner", saveBtn).CornerRadius = UDim.new(0, 6)
+
+    -- EVENTS
+    
+    -- Toggle Button Logic
+    toggleBtn.MouseButton1Click:Connect(function()
+        self.Config.Enabled = not self.Config.Enabled
+        toggleBtn.Text = self.Config.Enabled and "ON" or "OFF"
+        toggleBtn.BackgroundColor3 = self.Config.Enabled and Color3.fromRGB(0, 200, 100) or Color3.fromRGB(50, 50, 50)
+        status.BackgroundColor3 = self.Config.Enabled and Color3.fromRGB(0, 255, 200) or Color3.fromRGB(100, 100, 100)
+        self:SaveConfig() -- Save status toggle
+    end)
+
+    -- Settings Open/Close
+    settingsBtn.MouseButton1Click:Connect(function()
+        self.State.SettingsOpen = not self.State.SettingsOpen
+        configFrame.Visible = self.State.SettingsOpen
+    end)
+
+    -- Save Logic
+    saveBtn.MouseButton1Click:Connect(function()
+        self.Config.Webhook = wbInput.Text
+        self.Config.DiscordID = idInput.Text
+        self:SaveConfig() -- Save ke file
+        
+        saveBtn.Text = "SAVED!"
+        saveBtn.BackgroundColor3 = Color3.fromRGB(0, 200, 100)
+        
+        -- Test Webhook
+        self:Dispatch("📡 Config Test", "Webhook setup successful. Monitoring Active.", 3447003, true)
+        
+        task.wait(1.5)
+        saveBtn.Text = "SAVE & TEST"
+        saveBtn.BackgroundColor3 = Color3.fromRGB(0, 150, 255)
+    end)
+
+    self.UI = gui
+
+    -- Draggable
+    local dragging, dragStart, startPos
+    frame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = frame.Position
+            input.Changed:Connect(function() if input.UserInputState == Enum.UserInputState.End then dragging = false end end)
+        end
+    end)
+    frame.InputChanged:Connect(function(input)
+        if (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) and dragging then
+            local delta = input.Position - dragStart
+            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+end
+
+function Spectre:StartListeners()
+    self.StartTime = os.time()
+    
+    self.Services.Gui.ErrorMessageChanged:Connect(function()
+        local err = self.Services.Gui:GetErrorMessage()
+        if err and err ~= "" and not self.State.Teleporting then
+            self:Dispatch("🚨 SIGNAL LOST", err, 16711680, false)
+        end
+    end)
+    
+    self.Services.Input.WindowFocusReleased:Connect(function()
+        if not self.State.Disconnected then
+            self.State.Background = true
+            self:Dispatch("📱 BACKGROUND MODE", "Application minimized.", 16753920, true)
+            if self.UI then self.UI.Main.Status.BackgroundColor3 = Color3.fromRGB(255, 165, 0) end
+        end
+    end)
+    
+    self.Services.Input.WindowFocused:Connect(function()
+        if self.State.Background then
+            self.State.Background = false
+            if self.UI and self.Config.Enabled then self.UI.Main.Status.BackgroundColor3 = Color3.fromRGB(0, 255, 200) end
+        end
+    end)
+    
+    game.OnClose = function()
+        if not self.State.Teleporting and not self.State.Disconnected then
+            local reason = self.State.Background and "Force Close (Background)" or "Manual Kill / Crash"
+            if self.Services.Stats:GetTotalMemoryUsageMb() > self.Config.CrashRAM then reason = "💥 CRASH (Memory Overflow)" end
+            self:Dispatch("🚪 PROCESS TERMINATED", reason, 12370112, false)
+        end
+    end
+    
+    self.Services.Players.LocalPlayer.OnTeleport:Connect(function()
+        self.State.Teleporting = true
+        if self.UI then self.UI.Main.Title.Text = "TELEPORTING..." end
+    end)
+    
+    task.spawn(function()
+        while true do
+            task.wait(1)
+            
+            if not self.State.Disconnected and not self.State.Teleporting then
+                local p, r, f = self:CaptureBlackbox()
+                
+                if self.UI then 
+                    self.UI.Main.Title.Text = format("%dms | %d MB", p, r)
+                end
+                
+                if p == self.State.LastPing and p > 0 then
+                    self.State.FreezeCount = self.State.FreezeCount + 1
+                    if self.State.FreezeCount >= self.Config.PingFreezeLimit then
+                        self:Dispatch("💀 GHOST DISCONNECT", "Connection Flatline Detected.", 16711680, false)
+                    end
+                else
+                    self.State.FreezeCount = 0
+                    self.State.LastPing = p
+                end
+            end
+        end
+    end)
+end
+
+-- MAIN EXECUTION
+Spectre:LoadConfig() -- Load config dulu
+Spectre:InitUI()     -- Buat UI
+Spectre:StartListeners() -- Mulai monitoring
+
+if Spectre.Services.Input.TouchEnabled then
+    game.StarterGui:SetCore("ChatMakeSystemMessage", { Text = "[Spectre] Loaded. Click Gear to Setup.", Color = Color3.fromRGB(0, 255, 200) })
+end
